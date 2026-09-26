@@ -5,6 +5,7 @@ S3 layout, statuses and compliance rules.
 """
 
 import base64
+import gc
 import hashlib
 import hmac
 import html
@@ -16,6 +17,7 @@ import traceback
 import urllib.parse
 import urllib.request
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
@@ -29,6 +31,14 @@ DOWNLOAD_TIMEOUT = 20
 PREVIEW_LEN = 140
 NOT_ATTACHED = "not attached (size/download)"
 STATUSES = ("unsorted", "client", "personal")
+CRM_BUCKET = "full-pipeline-cache"
+INDEX_KEY = "state/phone-index.json"
+BATCH_KEY = "state/batch-last.json"
+LOCK_KEY = "state/batch-lock.json"
+LOCK_TTL = timedelta(minutes=15)
+PIPELINE_PERSON_URL = "https://app.pipelinecrm.com/people/"
+MATCH_DIGITS = 9
+MIN_PHONE_DIGITS = 7
 
 _clients = {}
 
@@ -86,9 +96,9 @@ def _is_missing(exc):
     return code in ("NoSuchKey", "404", "NotFound")
 
 
-def s3_get_bytes(key):
+def s3_get_bytes(key, bucket=None):
     try:
-        return s3().get_object(Bucket=_bucket(), Key=key)["Body"].read()
+        return s3().get_object(Bucket=bucket or _bucket(), Key=key)["Body"].read()
     except Exception as e:
         if _is_missing(e):
             return None
@@ -348,6 +358,10 @@ def parse_payload(body):
         name = sender_name
     if not sender_name:
         sender_name = "Me" if direction == "OUT" else (name or "")
+    sender_phone = (_digits(_first(senders, phone_names))
+                    or _jid_digits(_first(senders, ("jid", "id")))
+                    or _digits(_first(msgs + tops, ("sender_phone", "from_phone",
+                                                    "author_phone"))))
 
     text = (_first(msgs, ("text", "body", "message_text", "content", "caption", "message"))
             or _first(tops, ("text", "message_text", "message", "caption", "content")))
@@ -374,6 +388,7 @@ def parse_payload(body):
         "is_group": bool(is_group),
         "chat_name": name if is_group else "",
         "sender_name": sender_name,
+        "sender_phone": sender_phone,
         "direction": direction,
         "text": text or "",
         "message_id": message_id,
@@ -411,6 +426,8 @@ def fmt_times(ts_iso):
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC"), k.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+
+
 # ---------------------------------------------------------------------------
 # Daily cap
 # ---------------------------------------------------------------------------
@@ -438,9 +455,9 @@ def cap_allows_send():
             f"WhatsApp Capture: daily forward cap ({DAILY_CAP}) reached",
             f"The daily cap of {DAILY_CAP} forward emails was reached on "
             f"{now_utc().strftime('%Y-%m-%d')} (UTC).\n\n"
-            "Forwarding is paused until 00:00 UTC. Client messages received meanwhile are "
-            "stored in S3 with forwarded:false. Use 'Forward held' on the admin page to send "
-            "them once the cap resets.\n",
+            "Forwarding is paused until 00:00 UTC. Unsent client messages stay in S3 with "
+            "forwarded:false and go out in the next daily batch (or 'Send now' on the admin "
+            "page once the cap resets).\n",
             [], cc=False)
     return False
 
@@ -450,6 +467,210 @@ def record_send():
     st = s3_get_json(key) or {"count": 0, "alerted": False}
     st["count"] = int(st.get("count", 0)) + 1
     s3_put_json(key, st)
+
+
+# ---------------------------------------------------------------------------
+# CRM phone index (s3://full-pipeline-cache/people.json + companies.json)
+# Phone field names are NOT verified -- see top_phone_keys in the index stats.
+# ---------------------------------------------------------------------------
+
+PHONE_DICT_KEYS = ("number", "value", "phone", "phone_number", "raw", "e164", "formatted",
+                   "display", "international")
+
+
+def _is_phone_key(k):
+    k = str(k).lower()
+    return "phone" in k or "mobile" in k
+
+
+def _phone_strings(v):
+    if isinstance(v, bool) or v is None:
+        return []
+    if isinstance(v, (str, int)):
+        return [str(v)]
+    if isinstance(v, list):
+        return [s for x in v for s in _phone_strings(x)]
+    if isinstance(v, dict):
+        return [s for k, x in v.items()
+                if k in PHONE_DICT_KEYS or _is_phone_key(k) for s in _phone_strings(x)]
+    return []
+
+
+def person_phones(p):
+    """[(key_name, digits)] for every phone-like value on a CRM person."""
+    found = []
+
+    def add(name, values):
+        for s in values:
+            d = re.sub(r"\D", "", s)
+            if len(d) >= MIN_PHONE_DIGITS:
+                found.append((name, d))
+
+    def scan(d, prefix):
+        for k, v in d.items():
+            if _is_phone_key(k):
+                add(prefix + str(k), _phone_strings(v))
+
+    scan(p, "")
+    cf = p.get("custom_fields")
+    if isinstance(cf, dict):
+        scan(cf, "custom_fields.")
+    elif isinstance(cf, list):
+        for item in cf:
+            if not isinstance(item, dict):
+                continue
+            label = next((str(item[x]) for x in ("name", "label", "key", "field_name", "title")
+                          if item.get(x)), "")
+            if _is_phone_key(label):
+                add("custom_fields." + label, _phone_strings(item.get("value", item.get("values"))))
+            else:
+                scan(item, "custom_fields[].")
+    return found
+
+
+def person_name(p):
+    name = p.get("full_name") or p.get("name")
+    if not name:
+        name = " ".join(str(p.get(k) or "").strip() for k in ("first_name", "last_name")).strip()
+    return str(name or "").strip()
+
+
+def person_company(p, companies):
+    c = p.get("company")
+    if isinstance(c, dict) and c.get("name"):
+        return str(c["name"]).strip()
+    if p.get("company_name"):
+        return str(p["company_name"]).strip()
+    cid = p.get("company_id")
+    if cid is not None:
+        return str(companies.get(str(cid)) or "").strip()
+    return ""
+
+
+def _load_crm_list(key, field):
+    raw = s3_get_bytes(key, bucket=CRM_BUCKET)
+    if raw is None:
+        raise RuntimeError(f"s3://{CRM_BUCKET}/{key} not found")
+    data = json.loads(raw)
+    del raw
+    gc.collect()
+    items = data.get(field) if isinstance(data, dict) else data
+    del data
+    return items or []
+
+
+def build_phone_index():
+    companies = {}
+    for c in _load_crm_list("companies.json", "companies"):
+        if isinstance(c, dict) and c.get("id") is not None:
+            companies[str(c["id"])] = c.get("name") or ""
+    gc.collect()
+
+    people = _load_crm_list("people.json", "people")
+    gc.collect()
+    index, key_counts = {}, Counter()
+    scanned = no_phone = 0
+    for p in people:
+        if not isinstance(p, dict):
+            continue
+        scanned += 1
+        phones = person_phones(p)
+        if not phones:
+            no_phone += 1
+            continue
+        pid = p.get("id")
+        entry = {"person_id": pid, "full_name": person_name(p),
+                 "company": person_company(p, companies)}
+        for kname, digits in phones:
+            key_counts[kname] += 1
+            k = digits[-MATCH_DIGITS:]
+            cur = index.get(k)
+            if cur is None:
+                index[k] = entry
+            elif "ambiguous" in cur:
+                if pid not in cur["ambiguous"]:
+                    cur["ambiguous"].append(pid)
+            elif cur["person_id"] != pid:
+                index[k] = {"ambiguous": [cur["person_id"], pid]}
+    del people, companies
+    gc.collect()
+
+    doc = {
+        "built_at": iso(now_utc()),
+        "people_scanned": scanned,
+        "phones_indexed": len(index),
+        "people_with_no_phone": no_phone,
+        "top_phone_keys": key_counts.most_common(10),
+        "index": index,
+    }
+    s3_put_bytes(INDEX_KEY, json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+                 .encode("utf-8"), "application/json")
+    del index
+    gc.collect()
+    return {k: v for k, v in doc.items() if k != "index"}
+
+
+def load_index():
+    return s3_get_json(INDEX_KEY) or {}
+
+
+def crm_lookup(index, phone):
+    d = re.sub(r"\D", "", phone or "")
+    none = {"crm_match": "none", "crm_person_id": None, "crm_full_name": None,
+            "crm_company": None}
+    if len(d) < MIN_PHONE_DIGITS:
+        return none
+    e = (index.get("index") or {}).get(d[-MATCH_DIGITS:])
+    if not e:
+        return none
+    if "ambiguous" in e:
+        return dict(none, crm_match="ambiguous", crm_ambiguous_ids=e["ambiguous"])
+    return {"crm_match": "matched", "crm_person_id": e.get("person_id"),
+            "crm_full_name": e.get("full_name"), "crm_company": e.get("company")}
+
+
+def migrate_contact(c):
+    """WhatsApp display name lives in wa_name (older records used 'name')."""
+    if "name" in c:
+        c.setdefault("wa_name", c["name"])
+        c.pop("name")
+    return c
+
+
+def wa_name(c):
+    return c.get("wa_name") or c.get("name") or (f"+{c['phone']}" if c.get("phone")
+                                                  else c.get("key", ""))
+
+
+def apply_crm(c, index):
+    """Refresh crm_* fields from the index. Returns True if the record changed."""
+    if not index.get("index"):
+        return False
+    fields = crm_lookup(index, "" if c.get("is_group") else c.get("phone"))
+    changed = any(c.get(k) != v for k, v in fields.items())
+    if "crm_ambiguous_ids" not in fields and "crm_ambiguous_ids" in c:
+        c.pop("crm_ambiguous_ids")
+        changed = True
+    c.update(fields)
+    return changed
+
+
+def identity(c):
+    """Manual override beats CRM; fallback '<WhatsApp name> [not in CRM]'."""
+    if c.get("manual_full_name"):
+        return {"full_name": c["manual_full_name"], "company": c.get("manual_company") or "",
+                "known": True, "source": "manual"}
+    if c.get("crm_match") == "matched" and c.get("crm_full_name"):
+        return {"full_name": c["crm_full_name"], "company": c.get("crm_company") or "",
+                "known": True, "source": "crm"}
+    return {"full_name": f"{wa_name(c)} [not in CRM]", "company": "", "known": False,
+            "source": "none"}
+
+
+def company_label(idn):
+    if idn["company"]:
+        return idn["company"]
+    return "Individual" if idn["known"] else "unknown (not in CRM)"
 
 
 # ---------------------------------------------------------------------------
@@ -480,28 +701,53 @@ def send_email(subject, body, attachments, cc=True):
                          RawMessage={"Data": msg.as_bytes()})
 
 
-def _phone_label(rec):
-    return f"+{rec['phone']}" if rec.get("phone") else "n/a"
+def batch_subject(c, n, date):
+    if c.get("is_group"):
+        return f"WhatsApp group | {wa_name(c)} | {n} messages | {date}"
+    idn = identity(c)
+    company = f" ({company_label(idn)})" if idn["known"] else ""
+    phone = f"+{c['phone']}" if c.get("phone") else "no phone"
+    return f"WhatsApp | {idn['full_name']}{company} | {phone} | {n} messages | {date}"
 
 
-def single_subject(rec):
-    if rec.get("is_group"):
-        return f"WhatsApp group | {rec.get('chat_name') or rec.get('contact_name')} | " \
-               f"{rec.get('sender_name') or 'unknown'}"
-    phone = f" (+{rec['phone']})" if rec.get("phone") else ""
-    return f"WhatsApp | {rec.get('contact_name')}{phone} | {rec.get('direction')}"
+def batch_header(c, recs):
+    first, _ = fmt_times(recs[0].get("timestamp"))
+    last, _ = fmt_times(recs[-1].get("timestamp"))
+    if c.get("is_group"):
+        lines = [f"Contact: {wa_name(c)} (group chat)", "Company: n/a (group)",
+                 "Phone: n/a", "Pipeline person ID: n/a (group)",
+                 f"WhatsApp name: {wa_name(c)}"]
+    else:
+        idn = identity(c)
+        pid = c.get("crm_person_id") if c.get("crm_match") == "matched" else None
+        lines = [f"Contact: {idn['full_name']}", f"Company: {company_label(idn)}",
+                 f"Phone: {'+' + c['phone'] if c.get('phone') else 'n/a'}",
+                 f"Pipeline person ID: {pid if pid else 'not in CRM'}",
+                 f"WhatsApp name: {wa_name(c)}"]
+    lines.append(f"Period: {first} - {last}")
+    lines.append(f"Messages: {len(recs)}")
+    return "\n".join(lines)
 
 
-def message_block(rec, att_status):
+def sender_label(c, rec, index):
+    if rec.get("direction") == "OUT":
+        return rec.get("sender_name") or "Me"
+    if c.get("is_group"):
+        sp = rec.get("sender_phone") or ""
+        m = crm_lookup(index, sp)
+        if m["crm_match"] == "matched" and m["crm_full_name"]:
+            return f"{m['crm_full_name']} ({m['crm_company'] or 'Individual'})"
+        return f"{rec.get('sender_name') or 'unknown'}{' (+' + sp + ')' if sp else ''}"
+    return identity(c)["full_name"]
+
+
+def message_block(c, rec, att_status, index):
     utc, kyiv = fmt_times(rec.get("timestamp"))
     lines = [
-        f"Contact: {rec.get('contact_name')}",
-        f"Phone: {_phone_label(rec)}",
-        f"Chat: {rec.get('chat_name') if rec.get('is_group') else 'Direct'}",
-        f"Sender: {rec.get('sender_name')}",
-        f"Direction: {rec.get('direction')}",
         f"Timestamp (UTC): {utc}",
         f"Timestamp (Europe/Kiev): {kyiv}",
+        f"Direction: {rec.get('direction')}",
+        f"Sender: {sender_label(c, rec, index)}",
         f"Message ID: {rec.get('message_id')}",
         "",
         rec.get("text") or "(no text)",
@@ -518,49 +764,44 @@ def message_block(rec, att_status):
     return "\n".join(lines)
 
 
-def collect_attachments(recs, cache=None):
-    """Load stored attachments from S3 while total email stays under the limit."""
-    cache = cache or {}
-    parts, status = [], {}
-    budget = MAX_EMAIL_BYTES - 64 * 1024 - sum(len(r.get("text") or "") * 2 for r in recs)
-    for rec in recs:
-        for i, a in enumerate(rec.get("attachments") or []):
-            k = a.get("s3_key")
-            if not k:
+def _encoded(n):
+    return (n * 4) // 3 + 2048
+
+
+def pack_parts(held):
+    """Yield (items, attachment_parts, att_status) chunks, each under MAX_EMAIL_BYTES.
+    A message is never dropped: if its attachments don't fit, they are listed instead."""
+    budget = MAX_EMAIL_BYTES - 64 * 1024
+    cur, parts, status, used = [], [], {}, 0
+    for k, r in held:
+        text_cost = len((r.get("text") or "").encode("utf-8")) * 2 + 2048
+        datas = []
+        for i, a in enumerate(r.get("attachments") or []):
+            if not a.get("s3_key"):
                 continue
-            size = a.get("size") or 0
-            encoded = (size * 4) // 3 + 2048
-            if size and encoded > budget:
+            try:
+                data = s3_get_bytes(a["s3_key"])
+            except Exception:
+                data = None
+            if data is not None:
+                datas.append((i, a, data))
+        cost = text_cost + sum(_encoded(len(d)) for _, _, d in datas)
+        if cur and used + cost > budget:
+            yield cur, parts, status
+            cur, parts, status, used = [], [], {}, 0
+        cur.append((k, r))
+        used += text_cost
+        for i, a, data in datas:
+            e = _encoded(len(data))
+            if used + e > budget:
                 continue
-            data = cache.get(k)
-            if data is None:
-                try:
-                    data = s3_get_bytes(k)
-                except Exception:
-                    data = None
-            if data is None:
-                continue
-            encoded = (len(data) * 4) // 3 + 2048
-            if encoded > budget:
-                continue
-            budget -= encoded
+            used += e
             ctype = a.get("content_type") or mimetypes.guess_type(a.get("filename") or "")[0]
             parts.append((a.get("filename") or "attachment", data,
                           ctype or "application/octet-stream"))
-            status[(rec.get("message_id"), i)] = "attached"
-    return parts, status
-
-
-def forward_single(rec, msg_key, cache=None):
-    if not forwarding_enabled() or not cap_allows_send():
-        return False
-    parts, status = collect_attachments([rec], cache)
-    send_email(single_subject(rec), message_block(rec, status) + "\n", parts)
-    record_send()
-    rec["forwarded"] = True
-    rec["forwarded_at"] = iso(now_utc())
-    s3_put_json(msg_key, rec)
-    return True
+            status[(r.get("message_id"), i)] = "attached"
+    if cur:
+        yield cur, parts, status
 
 
 def load_messages(ck):
@@ -573,27 +814,90 @@ def load_messages(ck):
     return out
 
 
-def forward_backlog(ck, contact):
-    """Forward every held (forwarded:false) message as ONE email. Returns count sent."""
-    held = [(k, r) for k, r in load_messages(ck) if not r.get("forwarded")]
-    if not held or not forwarding_enabled() or not cap_allows_send():
-        return 0
-    recs = [r for _, r in held]
-    parts, status = collect_attachments(recs)
-    phone = f" (+{contact['phone']})" if contact.get("phone") else ""
-    subject = f"WhatsApp backlog | {contact.get('name')}{phone} | {len(recs)} messages"
+def forward_contact(c, held, index, date, stats):
+    """Send held messages for one client contact; marks each part forwarded after it sends."""
     sep = "\n\n" + "-" * 60 + "\n\n"
-    body = (f"{len(recs)} held messages for {contact.get('name')}{phone}, "
-            f"chronological order.{sep}"
-            + sep.join(message_block(r, status) for r in recs) + "\n")
-    send_email(subject, body, parts)
-    record_send()
-    at = iso(now_utc())
-    for k, r in held:
-        r["forwarded"] = True
-        r["forwarded_at"] = at
-        s3_put_json(k, r)
-    return len(recs)
+    for n, (items, parts, status) in enumerate(pack_parts(held), 1):
+        if not cap_allows_send():
+            stats["cap_hit"] = True
+            return
+        recs = [r for _, r in items]
+        subject = batch_subject(c, len(recs), date) + (f" (part {n})" if n > 1 else "")
+        body = batch_header(c, recs) + sep + sep.join(
+            message_block(c, r, status, index) for r in recs) + "\n"
+        try:
+            send_email(subject, body, parts)
+        except Exception as e:
+            print("send failed:", c.get("key"), traceback.format_exc())
+            stats["errors"].append(f"{c.get('key')}: {type(e).__name__}: {e}"[:300])
+            return
+        record_send()
+        stats["emails_sent"] += 1
+        at = iso(now_utc())
+        for k, r in items:
+            r["forwarded"] = True
+            r["forwarded_at"] = at
+            s3_put_json(k, r)
+        stats["messages_forwarded"] += len(recs)
+
+
+# ---------------------------------------------------------------------------
+# Daily batch
+# ---------------------------------------------------------------------------
+
+def acquire_lock():
+    lk = s3_get_json(LOCK_KEY)
+    if lk:
+        at = _parse_ts(lk.get("at"))
+        if at and now_utc() - at < LOCK_TTL:
+            return False
+    s3_put_json(LOCK_KEY, {"at": iso(now_utc())})
+    return True
+
+
+def release_lock():
+    s3_delete_keys([LOCK_KEY])
+
+
+def refresh_contacts(index):
+    """Persist CRM lookup + wa_name migration on every contact. Returns contacts."""
+    contacts = []
+    for c in load_contacts():
+        before = json.dumps(c, sort_keys=True)
+        migrate_contact(c)
+        apply_crm(c, index)
+        if json.dumps(c, sort_keys=True) != before:
+            s3_put_json(contact_path(c["key"]), c)
+        contacts.append(c)
+    return contacts
+
+
+def run_batch(trigger):
+    if not acquire_lock():
+        return {"skipped": "another batch run is in progress"}
+    try:
+        stats = {"run_at": iso(now_utc()), "trigger": trigger, "emails_sent": 0,
+                 "messages_forwarded": 0, "messages_waiting": 0, "forwarding_enabled":
+                 forwarding_enabled(), "index_error": None, "errors": []}
+        try:
+            build_phone_index()
+        except Exception as e:
+            print("index rebuild failed:", traceback.format_exc())
+            stats["index_error"] = f"{type(e).__name__}: {e}"[:300]
+        index = load_index()
+        date = now_utc().strftime("%Y-%m-%d")
+        for c in refresh_contacts(index):
+            if c.get("status") != "client":
+                continue
+            held = [(k, r) for k, r in load_messages(c["key"]) if not r.get("forwarded")]
+            if held and forwarding_enabled() and not stats.get("cap_hit"):
+                forward_contact(c, held, index, date, stats)
+            stats["messages_waiting"] += sum(
+                1 for _, r in load_messages(c["key"]) if not r.get("forwarded"))
+        s3_put_json(BATCH_KEY, stats)
+        return stats
+    finally:
+        release_lock()
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +923,7 @@ def download(url):
         return data, ctype
 
 
-def store_attachments(ck, mid, atts, cache):
+def store_attachments(ck, mid, atts):
     used = set()
     out = []
     for i, a in enumerate(atts):
@@ -634,7 +938,6 @@ def store_attachments(ck, mid, atts, cache):
             ctype = ctype or mimetypes.guess_type(fn)[0] or "application/octet-stream"
             key = f"attachments/{ck}/{mid}/{fn}"
             s3_put_bytes(key, data, ctype)
-            cache[key] = data
             entry.update(s3_key=key, size=len(data), content_type=ctype)
         except Exception as e:
             entry["error"] = f"{type(e).__name__}: {e}"[:300]
@@ -643,6 +946,7 @@ def store_attachments(ck, mid, atts, cache):
 
 
 def handle_webhook(raw):
+    """Store every non-Personal message. Never sends email (forwarding is the daily batch)."""
     try:
         body = json.loads(raw)
     except Exception:
@@ -661,10 +965,11 @@ def handle_webhook(raw):
 
     now = iso(now_utc())
     contact = s3_get_json(contact_path(ck)) or {
-        "key": ck, "name": msg["name"], "phone": msg["phone"], "is_group": msg["is_group"],
+        "key": ck, "wa_name": msg["name"], "phone": msg["phone"], "is_group": msg["is_group"],
         "status": "unsorted", "first_seen": now, "last_seen": now,
         "last_preview": "", "msg_count": 0,
     }
+    migrate_contact(contact)
     status = contact.get("status") if contact.get("status") in STATUSES else "unsorted"
 
     if status == "personal":
@@ -675,7 +980,7 @@ def handle_webhook(raw):
     ts = msg["timestamp"] or now_utc()
     preview = msg["text"] or ", ".join(a["filename"] for a in msg["attachments"])
     if msg["name"] and msg["name"] != ck:
-        contact["name"] = msg["name"]
+        contact["wa_name"] = msg["name"]
     if msg["phone"]:
         contact["phone"] = msg["phone"]
     contact["is_group"] = msg["is_group"]
@@ -684,16 +989,16 @@ def handle_webhook(raw):
     contact["msg_count"] = int(contact.get("msg_count", 0)) + 1
 
     s3_put_bytes(f"raw/{ck}/{mid}.json", raw, "application/json")
-    cache = {}
-    atts = store_attachments(ck, mid, msg["attachments"], cache)
+    atts = store_attachments(ck, mid, msg["attachments"])
     rec = {
         "message_id": mid,
         "contact_key": ck,
-        "contact_name": contact["name"],
+        "contact_name": wa_name(contact),
         "phone": msg["phone"] or contact.get("phone", ""),
         "is_group": msg["is_group"],
-        "chat_name": msg["chat_name"] or (contact["name"] if msg["is_group"] else ""),
+        "chat_name": msg["chat_name"] or (wa_name(contact) if msg["is_group"] else ""),
         "sender_name": msg["sender_name"],
+        "sender_phone": msg["sender_phone"],
         "direction": msg["direction"],
         "timestamp": iso(ts),
         "received_at": now,
@@ -706,9 +1011,6 @@ def handle_webhook(raw):
     s3_put_json(msg_key, rec)
     s3_put_json(contact_path(ck), contact)
     s3_put_json(seen_key, {"contact_key": ck, "at": now})
-
-    if status == "client":
-        forward_single(rec, msg_key, cache)
 
 
 # ---------------------------------------------------------------------------
@@ -741,22 +1043,69 @@ def delete_unforwarded(ck):
     return len(kept)
 
 
-def admin_action(ck, action):
-    ck = safe(ck)
+def manual_identity(form):
+    """Validate the Full name / Company form. Returns (fields, error)."""
+    full = _clean_header(form.get("full_name"))[:200]
+    company = _clean_header(form.get("company"))[:200]
+    individual = form.get("individual") in ("1", "on", "true")
+    if not full:
+        return None, "Full name is required."
+    if not company and not individual:
+        return None, "Company is required unless 'Individual — no company' is ticked."
+    return {"manual_full_name": full, "manual_company": "" if individual else company,
+            "manual_individual": individual}, None
+
+
+def _batch_flash(st):
+    if st.get("skipped"):
+        return f"Send now skipped: {st['skipped']}."
+    msg = (f"Batch done: {st['emails_sent']} emails, {st['messages_forwarded']} messages "
+           f"forwarded, {st['messages_waiting']} waiting.")
+    if not st.get("forwarding_enabled"):
+        msg += " Forwarding is OFF."
+    if st.get("cap_hit"):
+        msg += " Daily cap reached."
+    if st.get("errors"):
+        msg += f" {len(st['errors'])} send error(s)."
+    if st.get("index_error"):
+        msg += f" Index rebuild failed: {st['index_error']}"
+    return msg
+
+
+def admin_action(form):
+    action = form.get("action", "")
+    if action == "send_now":
+        return _batch_flash(run_batch("admin"))
+    if action == "rebuild_index":
+        st = build_phone_index()
+        refresh_contacts(load_index())
+        return (f"Index rebuilt: {st['people_scanned']} people, {st['phones_indexed']} phones, "
+                f"{st['people_with_no_phone']} without phone.")
+
+    ck = safe(form.get("contact_key", ""))
     contact = s3_get_json(contact_path(ck))
     if not contact:
         return "Contact not found."
-    name = contact.get("name") or ck
+    migrate_contact(contact)
+    name = wa_name(contact)
     if action == "client":
+        apply_crm(contact, load_index())
+        if not contact.get("is_group") and not identity(contact)["known"]:
+            fields, err = manual_identity(form)
+            if err:
+                return f"{name} not changed: {err}"
+            contact.update(fields)
         contact["status"] = "client"
         contact["sorted_at"] = iso(now_utc())
         s3_put_json(contact_path(ck), contact)
-        n = forward_backlog(ck, contact)
-        held = sum(1 for _, r in load_messages(ck) if not r.get("forwarded"))
-        note = f" {n} held messages forwarded." if n else ""
-        if held:
-            note += f" {held} still held (forwarding off or daily cap)."
-        return f"{name} marked Client.{note}"
+        return f"{name} marked Client. Held messages go out in the next daily batch."
+    if action == "set_identity":
+        fields, err = manual_identity(form)
+        if err:
+            return f"{name} not changed: {err}"
+        contact.update(fields)
+        s3_put_json(contact_path(ck), contact)
+        return f"{name} identity set to {fields['manual_full_name']}."
     if action == "personal":
         kept = delete_unforwarded(ck)
         contact["status"] = "personal"
@@ -765,12 +1114,6 @@ def admin_action(ck, action):
         contact["msg_count"] = kept
         s3_put_json(contact_path(ck), contact)
         return f"{name} marked Personal. Unforwarded content deleted."
-    if action == "forward_held":
-        if contact.get("status") != "client":
-            return "Only Client contacts can be forwarded."
-        n = forward_backlog(ck, contact)
-        return f"{n} held messages forwarded for {name}." if n else \
-            f"Nothing forwarded for {name} (none held, forwarding off, or daily cap)."
     return "Unknown action."
 
 
@@ -797,7 +1140,7 @@ def daily_nudge():
     for c in unsorted:
         phone = f"+{c['phone']}" if c.get("phone") else "(no phone)"
         group = " [group]" if c.get("is_group") else ""
-        lines.append(f"- {c.get('name')}{group} {phone} -- {c.get('msg_count', 0)} msgs")
+        lines.append(f"- {wa_name(c)}{group} {phone} -- {c.get('msg_count', 0)} msgs")
         if c.get("last_preview"):
             lines.append(f"    \"{c['last_preview']}\"")
     lines += ["", "Sort them here:",
@@ -816,17 +1159,24 @@ CSS = """
 sans-serif;margin:0;background:#f4f5f7;color:#1d2330}main{max-width:820px;margin:0 auto;
 padding:16px}h1{font-size:22px;margin:8px 0}h2{font-size:17px;margin:24px 0 8px}
 .status{font-size:13px;color:#555;background:#fff;border:1px solid #e1e4e8;border-radius:8px;
-padding:8px 12px}.status a{color:#2463eb}.flash{background:#e8f5e9;border:1px solid #b7dfb9;
-border-radius:8px;padding:8px 12px;margin:8px 0;font-size:14px}.card{background:#fff;
-border:1px solid #e1e4e8;border-radius:8px;padding:10px 12px;margin:8px 0;display:flex;
-gap:10px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
-.info{flex:1 1 300px;min-width:0}.name{font-weight:600}.meta{font-size:12px;color:#666}
-.preview{font-size:13px;color:#333;margin-top:4px;overflow-wrap:anywhere}
-.badge{display:inline-block;font-size:11px;background:#ede9fe;color:#5b21b6;border-radius:4px;
-padding:1px 6px;margin-left:6px}.btns{display:flex;gap:6px;flex-wrap:wrap}
+padding:8px 12px;margin:6px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+justify-content:space-between}.status a{color:#2463eb}.flash{background:#e8f5e9;
+border:1px solid #b7dfb9;border-radius:8px;padding:8px 12px;margin:8px 0;font-size:14px}
+.card{background:#fff;border:1px solid #e1e4e8;border-radius:8px;padding:10px 12px;
+margin:8px 0;display:flex;gap:10px;align-items:flex-start;justify-content:space-between;
+flex-wrap:wrap}.info{flex:1 1 300px;min-width:0}.name{font-weight:600}
+.meta{font-size:12px;color:#666}.preview{font-size:13px;color:#333;margin-top:4px;
+overflow-wrap:anywhere}.badge{display:inline-block;font-size:11px;background:#ede9fe;
+color:#5b21b6;border-radius:4px;padding:1px 6px;margin-left:6px;text-decoration:none}
+.crm{background:#dcfce7;color:#166534}.warn{background:#fef3c7;color:#92400e}
+.btns{display:flex;gap:6px;flex-wrap:wrap;align-items:flex-start}
 button{border:0;border-radius:6px;padding:8px 12px;font-size:14px;cursor:pointer}
 .b-client{background:#2463eb;color:#fff}.b-personal{background:#e5e7eb;color:#111}
 .b-held{background:#f59e0b;color:#111}.empty{color:#888;font-size:14px}
+.idform{display:flex;flex-direction:column;gap:6px;min-width:220px}
+.idform input[type=text]{padding:7px 8px;border:1px solid #d1d5db;border-radius:6px;
+font-size:14px}.idform label{font-size:12px;color:#444}
+details summary{cursor:pointer;font-size:14px;color:#2463eb;padding:8px 4px}
 pre{background:#fff;border:1px solid #e1e4e8;border-radius:8px;padding:10px;overflow-x:auto;
 font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
 """
@@ -841,12 +1191,33 @@ def _e(s):
     return html.escape(str(s if s is not None else ""), quote=True)
 
 
-def _form(ck, action, label, cls, confirm_text):
-    return (f'<form method="POST" action="/" data-confirm="{_e(confirm_text)}">'
-            f'<input type="hidden" name="key" value="{_e(env("ADMIN_KEY"))}">'
-            f'<input type="hidden" name="contact_key" value="{_e(ck)}">'
-            f'<input type="hidden" name="action" value="{_e(action)}">'
+def _form(ck, action, label, cls, confirm_text, fields=""):
+    ck_input = (f'<input type="hidden" name="contact_key" value="{_e(ck)}">' if ck else "")
+    return (f'<form method="POST" action="/" data-confirm="{_e(confirm_text)}"'
+            f'{" class=idform" if fields else ""}>'
+            f'<input type="hidden" name="key" value="{_e(env("ADMIN_KEY"))}">{ck_input}'
+            f'<input type="hidden" name="action" value="{_e(action)}">{fields}'
             f'<button class="{cls}" type="submit">{_e(label)}</button></form>')
+
+
+def _identity_fields(c):
+    ind = c.get("manual_individual")
+    return (f'<input type="text" name="full_name" required placeholder="Full name" '
+            f'value="{_e(c.get("manual_full_name") or "")}">'
+            f'<input type="text" name="company" placeholder="Company" '
+            f'value="{_e(c.get("manual_company") or "")}">'
+            f'<label><input type="checkbox" name="individual" value="1"'
+            f'{" checked" if ind else ""}> Individual — no company</label>')
+
+
+def _client_button(c, label):
+    """One click if identity is known (or group); otherwise inline Full name/Company form."""
+    who = wa_name(c)
+    if c.get("is_group") or identity(c)["known"]:
+        return _form(c["key"], "client", label, "b-client",
+                     f"Mark {who} as CLIENT? Held messages go out in the next daily batch.")
+    return _form(c["key"], "client", label, "b-client",
+                 f"Mark {who} as CLIENT with this name/company?", _identity_fields(c))
 
 
 def _page(body):
@@ -861,9 +1232,38 @@ def _phone(c):
     return f"+{c['phone']}" if c.get("phone") else ""
 
 
+def _name_html(c):
+    """'<CRM full name> — <company>' + Pipeline badge when identified; WA name + phone below."""
+    group = '<span class="badge">group</span>' if c.get("is_group") else ""
+    idn = identity(c)
+    if c.get("is_group") or not idn["known"]:
+        warn = ""
+        if not c.get("is_group"):
+            label = "CRM: ambiguous" if c.get("crm_match") == "ambiguous" else "not in CRM"
+            warn = f'<span class="badge warn">{label}</span>'
+        return (f'<div class="name">{_e(wa_name(c))}{group}{warn}</div>'
+                f'<div class="meta">{_e(_phone(c))}')
+    badge = ""
+    if c.get("crm_match") == "matched" and c.get("crm_person_id") is not None:
+        badge = (f'<a class="badge crm" target="_blank" rel="noopener noreferrer" '
+                 f'href="{_e(PIPELINE_PERSON_URL + str(c["crm_person_id"]))}">Pipeline</a>')
+    manual = '<span class="badge">manual</span>' if idn["source"] == "manual" else ""
+    return (f'<div class="name">{_e(idn["full_name"])} — {_e(company_label(idn))}'
+            f'{badge}{manual}</div>'
+            f'<div class="meta">WhatsApp: {_e(wa_name(c))} {_e(_phone(c))}')
+
+
+def _held_count(c):
+    return sum(1 for _, r in load_messages(c["key"]) if not r.get("forwarded"))
+
+
 def render_admin(flash=""):
-    contacts = load_contacts()
-    _annotate_held(contacts)
+    index = load_index()
+    contacts = []
+    for c in load_contacts():  # CRM lookup in memory only: GET never writes
+        migrate_contact(c)
+        apply_crm(c, index)
+        contacts.append(c)
     unparsed = sum(1 for _ in s3_list("unparsed/"))
     admin_q = "?key=" + urllib.parse.quote(env("ADMIN_KEY"), safe="")
     by = {s: [] for s in STATUSES}
@@ -871,12 +1271,35 @@ def render_admin(flash=""):
         by[c.get("status") if c.get("status") in STATUSES else "unsorted"].append(c)
     for lst in by.values():
         lst.sort(key=lambda c: c.get("last_seen") or "", reverse=True)
+    waiting = 0
+    for c in by["client"]:
+        c["held_count"] = _held_count(c)
+        waiting += c["held_count"]
+    last = s3_get_json(BATCH_KEY) or {}
 
     out = ["<h1>WhatsApp Capture</h1>",
-           f'<div class="status">Forwarding: <b>{"ON" if forwarding_enabled() else "OFF"}</b>'
+           f'<div class="status"><span>Forwarding: <b>'
+           f'{"ON" if forwarding_enabled() else "OFF"}</b>'
            f' &middot; Emails sent today: <b>{sent_today()}</b> / {DAILY_CAP}'
            f' &middot; Unparsed payloads: <b>{unparsed}</b>'
-           f' (<a href="{_e(admin_q)}&amp;view=unparsed">view</a>)</div>']
+           f' (<a href="{_e(admin_q)}&amp;view=unparsed">view</a>)</span></div>',
+           f'<div class="status"><span>Last batch: <b>{_e(last.get("run_at") or "never")}</b>'
+           f' &middot; emails sent: <b>{last.get("emails_sent", 0)}</b>'
+           f' &middot; messages forwarded: <b>{last.get("messages_forwarded", 0)}</b>'
+           f' &middot; messages waiting: <b>{waiting}</b></span>'
+           + _form("", "send_now", "Send now", "b-held",
+                   f"Run the daily batch now and email {waiting} waiting client message(s)?")
+           + "</div>"]
+    top_keys = ", ".join(f"{k} ({n})" for k, n in index.get("top_phone_keys") or [])
+    out.append(
+        f'<div class="status"><span>CRM index: <b>{_e(index.get("built_at") or "never built")}'
+        f'</b> &middot; people: {index.get("people_scanned", 0)}'
+        f' &middot; phones indexed: {index.get("phones_indexed", 0)}'
+        f' &middot; people with no phone: {index.get("people_with_no_phone", 0)}'
+        f'<br>Top phone keys: {_e(top_keys or "n/a")}</span>'
+        + _form("", "rebuild_index", "Rebuild index", "b-personal",
+                "Rebuild the CRM phone index from people.json now?")
+        + "</div>")
     if flash:
         out.append(f'<div class="flash">{_e(flash)}</div>')
 
@@ -884,17 +1307,14 @@ def render_admin(flash=""):
     if not by["unsorted"]:
         out.append('<p class="empty">Nothing to sort.</p>')
     for c in by["unsorted"]:
-        badge = '<span class="badge">group</span>' if c.get("is_group") else ""
         n = c.get("msg_count", 0)
         out.append(
-            f'<div class="card"><div class="info"><div class="name">{_e(c.get("name"))}{badge}'
-            f'</div><div class="meta">{_e(_phone(c))} &middot; {n} held &middot; last seen '
-            f'{_e(c.get("last_seen"))}</div><div class="preview">{_e(c.get("last_preview"))}'
-            f'</div></div><div class="btns">'
-            + _form(c["key"], "client", "Client", "b-client",
-                    f"Mark {c.get('name')} as CLIENT and forward {n} held message(s)?")
+            f'<div class="card"><div class="info">{_name_html(c)} &middot; {n} held &middot; '
+            f'last seen {_e(c.get("last_seen"))}</div><div class="preview">'
+            f'{_e(c.get("last_preview"))}</div></div><div class="btns">'
+            + _client_button(c, "Client")
             + _form(c["key"], "personal", "Personal", "b-personal",
-                    f"Mark {c.get('name')} as PERSONAL and permanently delete {n} held "
+                    f"Mark {wa_name(c)} as PERSONAL and permanently delete {n} held "
                     "message(s)?")
             + "</div></div>")
 
@@ -902,17 +1322,19 @@ def render_admin(flash=""):
     if not by["client"]:
         out.append('<p class="empty">No clients yet.</p>')
     for c in by["client"]:
-        held = ""
-        if c.get("held_count"):
-            held = _form(c["key"], "forward_held", f"Forward held ({c['held_count']})", "b-held",
-                         f"Forward held messages for {c.get('name')} now?")
+        held = f" &middot; {c['held_count']} waiting" if c.get("held_count") else ""
+        edit = ""
+        if not c.get("is_group"):
+            edit = ("<details><summary>Edit</summary>"
+                    + _form(c["key"], "set_identity", "Save", "b-client",
+                            f"Override name/company for {wa_name(c)}?", _identity_fields(c))
+                    + "</details>")
         out.append(
-            f'<div class="card"><div class="info"><div class="name">{_e(c.get("name"))}'
-            f'{"<span class=badge>group</span>" if c.get("is_group") else ""}</div>'
-            f'<div class="meta">{_e(_phone(c))} &middot; last seen {_e(c.get("last_seen"))} '
-            f'&middot; {c.get("msg_count", 0)} msgs</div></div><div class="btns">{held}'
+            f'<div class="card"><div class="info">{_name_html(c)} &middot; last seen '
+            f'{_e(c.get("last_seen"))} &middot; {c.get("msg_count", 0)} msgs{held}</div></div>'
+            f'<div class="btns">{edit}'
             + _form(c["key"], "personal", "Move to Personal", "b-personal",
-                    f"Move {c.get('name')} to PERSONAL? Future messages will not be stored. "
+                    f"Move {wa_name(c)} to PERSONAL? Future messages will not be stored. "
                     "Already-forwarded messages are kept; unforwarded ones are deleted.")
             + "</div></div>")
 
@@ -921,19 +1343,9 @@ def render_admin(flash=""):
         out.append('<p class="empty">No personal contacts.</p>')
     for c in by["personal"]:
         out.append(
-            f'<div class="card"><div class="info"><div class="name">{_e(c.get("name"))}'
-            f'{"<span class=badge>group</span>" if c.get("is_group") else ""}</div>'
-            f'<div class="meta">{_e(_phone(c))}</div></div><div class="btns">'
-            + _form(c["key"], "client", "Move to Client", "b-client",
-                    f"Move {c.get('name')} to CLIENT? Future messages will be forwarded.")
-            + "</div></div>")
+            f'<div class="card"><div class="info">{_name_html(c)}</div></div>'
+            f'<div class="btns">' + _client_button(c, "Move to Client") + "</div></div>")
     return _page("".join(out))
-
-
-def _annotate_held(contacts):
-    for c in contacts:
-        if c.get("status") == "client":
-            c["held_count"] = sum(1 for _, r in load_messages(c["key"]) if not r.get("forwarded"))
 
 
 def render_unparsed():
@@ -984,6 +1396,10 @@ def _raw_body(event):
 
 def lambda_handler(event, context):
     event = event or {}
+    task = event.get("task") or (event.get("detail") if isinstance(event.get("detail"), dict)
+                                 else {}).get("task")
+    if task == "daily_forward" and "requestContext" not in event:
+        return run_batch("schedule")
     if event.get("source") == "aws.events" or event.get("detail-type") == "Scheduled Event":
         n = daily_nudge()
         return {"nudged": n}
@@ -1021,7 +1437,7 @@ def lambda_handler(event, context):
     form = dict(urllib.parse.parse_qsl(raw.decode("utf-8", "replace")))
     if key_ok(form.get("key", ""), env("ADMIN_KEY")):
         try:
-            flash = admin_action(form.get("contact_key", ""), form.get("action", ""))
+            flash = admin_action(form)
         except Exception as e:
             print("admin error:", traceback.format_exc())
             flash = f"Error: {type(e).__name__}: {e}"
