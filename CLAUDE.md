@@ -42,7 +42,7 @@ optional `CC_ADDR` (comma-separated; added as CC on forward/backlog emails).
 - `unparsed/YYYY/MM/DD/<uuid>.json` — payloads the parser could not handle (or that raised).
 - `state/sent-YYYY-MM-DD.json` — daily email counter `{count, alerted}`.
 - `state/phone-index.json` — CRM phone index `{built_at, people_scanned, phones_indexed,
-  people_with_no_phone, top_phone_keys, index: {last9: {person_id, full_name, company} |
+  people_with_no_phone, top_phone_keys, skipped_non_phone_values, index: {last9: {person_id, full_name, company} |
   {ambiguous: [ids]}}}`.
 - `state/batch-last.json` — last batch stats; `state/batch-lock.json` — 15-min run lock.
 
@@ -78,9 +78,10 @@ migrated on write), `crm_match` (`matched`|`ambiguous`|`none`), `crm_person_id`,
 - Match on the last 9 digits of the phone. Two different people on one key → ambiguous.
 - Identity precedence: manual override > CRM match > fallback `<WhatsApp name> [not in CRM]`.
   Missing identity never blocks forwarding.
-- **Phone field names are UNVERIFIED**: the index collects every value whose key contains
-  "phone"/"mobile" (top level, custom_fields, lists of phone dicts). Check "Top phone keys" on
-  the admin page after the first rebuild and tighten `person_phones` accordingly.
+- Phone fields are **verified** against people.json: `phone`, `mobile`, `home_phone`
+  (`work_phone` also read if present). Top-level allowlist only — never scan by substring
+  (e.g. `image_mobile_url` is a photo URL). Values containing "http", "/" or "@", or with
+  fewer than 7 / more than 15 digits, are skipped and counted in `skipped_non_phone_values`.
 
 ## Payload parser is UNVERIFIED
 The TimelinesAI Webhooks v2 payload shape has not been confirmed. `parse_payload` searches

@@ -65,14 +65,17 @@ PEOPLE = {"people": [
     {"id": 101, "full_name": "Ivan Petrenko", "company": {"id": 1, "name": "Acme Capital"},
      "phone": "+380 (50) 123-4567"},
     {"id": 102, "first_name": "Olena", "last_name": "Kovalenko", "company_id": 2,
-     "custom_fields": {"Mobile Phone": "067 111 2233"}},
+     "home_phone": "+380 67 111 2233"},
     {"id": 103, "name": "Petro Solo", "company_name": "Solo LLC",
-     "phones": [{"number": "+44 20 7946 0001", "type": "work"}]},
+     "phone": "+44 20 7946 0001"},
     {"id": 104, "full_name": "Twin A", "work_phone": "+1 555 000 9999"},
     {"id": 105, "full_name": "Twin B", "mobile": "001-555-000-9999"},
     {"id": 106, "full_name": "No Phone Person", "phone": "123"},
-    {"id": 107, "full_name": "Freelancer", "custom_fields": [
-        {"name": "Cell phone", "value": "+971 50 000 1111"}]},
+    {"id": 107, "full_name": "Photo Only",
+     "image_mobile_url": "https://cdn.example.com/people/971500001111/mobile.jpg"},
+    {"id": 108, "full_name": "Junk Values", "phone": "https://example.com/380631234567",
+     "mobile": "380631234567@s.whatsapp.net", "home_phone": "1234567890123456",
+     "work_phone": "380/63/123/4567"},
 ]}
 COMPANIES = {"companies": [{"id": 1, "name": "Acme Capital"}, {"id": 2, "name": "Kyiv Partners"}]}
 
@@ -240,32 +243,49 @@ class TestParser(unittest.TestCase):
 
 class TestPhoneIndex(Base):
     def test_phone_normalization(self):
-        phones = lf.person_phones({"id": 1, "phone": "+380 (50) 123-4567", "fax": "999999999",
-                                   "Mobile": 380671112233, "home_phone": "12-34",
-                                   "phones": [{"number": "+44 20 7946 0001", "id": 55}]})
-        self.assertEqual(sorted(d for _, d in phones),
-                         ["380501234567", "380671112233", "442079460001"])
+        phones, skipped = lf.person_phones({
+            "id": 1, "phone": "+380 (50) 123-4567", "fax": "999999999",
+            "mobile": 380671112233, "home_phone": "12-34", "Mobile Phone": "0441234567",
+            "image_mobile_url": "https://img.example/380509999999.png",
+            "phones": [{"number": "+44 20 7946 0001"}],
+            "custom_fields": {"Mobile Phone": "067 111 2233"}})
+        self.assertEqual(phones, [("phone", "380501234567"), ("mobile", "380671112233")])
+        self.assertEqual(skipped, 1)                       # home_phone "12-34"
+
+    def test_url_like_and_out_of_range_values_skipped(self):
+        for v in ("https://x.example/380501234567", "http:380501234567", "380/50/123/4567",
+                  "380501234567@s.whatsapp.net", "123456", "1234567890123456"):
+            phones, skipped = lf.person_phones({"phone": v})
+            self.assertEqual((phones, skipped), ([], 1), v)
+        phones, skipped = lf.person_phones({"phone": "1234567"})
+        self.assertEqual((phones, skipped), ([("phone", "1234567")], 0))
+        phones, skipped = lf.person_phones({"phone": "+1 234 567 890 12345"})   # 15 digits
+        self.assertEqual(len(phones), 1)
 
     def test_build_stats_and_lookup(self):
         st = lf.build_phone_index()
-        self.assertEqual(st["people_scanned"], 7)
-        self.assertEqual(st["people_with_no_phone"], 1)
-        self.assertEqual(st["phones_indexed"], 5)
-        self.assertIn(["phone", 1], [list(x) for x in st["top_phone_keys"]])
+        self.assertEqual(st["people_scanned"], 8)
+        self.assertEqual(st["people_with_no_phone"], 3)
+        self.assertEqual(st["phones_indexed"], 4)
+        self.assertEqual(st["skipped_non_phone_values"], 5)
+        self.assertEqual(sorted(tuple(x) for x in st["top_phone_keys"]),
+                         [("home_phone", 1), ("mobile", 1), ("phone", 2), ("work_phone", 1)])
         idx = lf.load_index()
         self.assertIn("built_at", idx)
+        self.assertEqual(idx["skipped_non_phone_values"], 5)
         # last-9 match across different prefixes / formatting
         m = lf.crm_lookup(idx, "0501234567")
         self.assertEqual((m["crm_match"], m["crm_person_id"], m["crm_full_name"],
                           m["crm_company"]), ("matched", 101, "Ivan Petrenko", "Acme Capital"))
-        # company via company_id, name via first+last, phone via custom_fields dict
+        # company via company_id, name via first+last, phone via home_phone
         m = lf.crm_lookup(idx, "+380671112233")
         self.assertEqual((m["crm_full_name"], m["crm_company"]),
                          ("Olena Kovalenko", "Kyiv Partners"))
-        # company_name fallback + list of phone dicts
+        # company_name fallback
         self.assertEqual(lf.crm_lookup(idx, "442079460001")["crm_company"], "Solo LLC")
-        # custom_fields list form
-        self.assertEqual(lf.crm_lookup(idx, "971500001111")["crm_full_name"], "Freelancer")
+        # image_mobile_url digits are never indexed; junk values never indexed
+        self.assertEqual(lf.crm_lookup(idx, "971500001111")["crm_match"], "none")
+        self.assertEqual(lf.crm_lookup(idx, "380631234567")["crm_match"], "none")
         # ambiguous
         m = lf.crm_lookup(idx, "15550009999")
         self.assertEqual(m["crm_match"], "ambiguous")
@@ -683,7 +703,8 @@ class TestAdmin(Base):
         self.assertIn('class="badge">group', page)
         self.assertIn('value="send_now"', page)
         self.assertIn('value="rebuild_index"', page)
-        self.assertIn("people with no phone: 1", page)
+        self.assertIn("people with no phone: 3", page)
+        self.assertIn("skipped non-phone values: 5", page)
         self.assertIn("Last batch: <b>never</b>", page)
         self.assertNotIn("not sent today", page)   # nothing waiting (no clients)
         self.assertIn("confirm(", page)

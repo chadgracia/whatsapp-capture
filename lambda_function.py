@@ -39,6 +39,7 @@ LOCK_TTL = timedelta(minutes=15)
 PIPELINE_PERSON_URL = "https://app.pipelinecrm.com/people/"
 MATCH_DIGITS = 9
 MIN_PHONE_DIGITS = 7
+MAX_PHONE_DIGITS = 15
 
 _clients = {}
 
@@ -471,61 +472,31 @@ def record_send():
 
 # ---------------------------------------------------------------------------
 # CRM phone index (s3://full-pipeline-cache/people.json + companies.json)
-# Phone field names are NOT verified -- see top_phone_keys in the index stats.
+# Phone fields verified against people.json: phone, mobile, home_phone (+ work_phone if present).
 # ---------------------------------------------------------------------------
 
-PHONE_DICT_KEYS = ("number", "value", "phone", "phone_number", "raw", "e164", "formatted",
-                   "display", "international")
-
-
-def _is_phone_key(k):
-    k = str(k).lower()
-    return "phone" in k or "mobile" in k
-
-
-def _phone_strings(v):
-    if isinstance(v, bool) or v is None:
-        return []
-    if isinstance(v, (str, int)):
-        return [str(v)]
-    if isinstance(v, list):
-        return [s for x in v for s in _phone_strings(x)]
-    if isinstance(v, dict):
-        return [s for k, x in v.items()
-                if k in PHONE_DICT_KEYS or _is_phone_key(k) for s in _phone_strings(x)]
-    return []
+PHONE_FIELDS = ("phone", "mobile", "home_phone", "work_phone")
 
 
 def person_phones(p):
-    """[(key_name, digits)] for every phone-like value on a CRM person."""
-    found = []
-
-    def add(name, values):
-        for s in values:
-            d = re.sub(r"\D", "", s)
-            if len(d) >= MIN_PHONE_DIGITS:
-                found.append((name, d))
-
-    def scan(d, prefix):
-        for k, v in d.items():
-            if _is_phone_key(k):
-                add(prefix + str(k), _phone_strings(v))
-
-    scan(p, "")
-    cf = p.get("custom_fields")
-    if isinstance(cf, dict):
-        scan(cf, "custom_fields.")
-    elif isinstance(cf, list):
-        for item in cf:
-            if not isinstance(item, dict):
-                continue
-            label = next((str(item[x]) for x in ("name", "label", "key", "field_name", "title")
-                          if item.get(x)), "")
-            if _is_phone_key(label):
-                add("custom_fields." + label, _phone_strings(item.get("value", item.get("values"))))
-            else:
-                scan(item, "custom_fields[].")
-    return found
+    """Return ([(field, digits)], skipped) from the allowlisted top-level phone fields.
+    Values containing 'http', '/' or '@', or with <7 or >15 digits, are skipped."""
+    found, skipped = [], 0
+    for field in PHONE_FIELDS:
+        v = p.get(field)
+        if isinstance(v, bool) or not isinstance(v, (str, int)):
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        d = re.sub(r"\D", "", s)
+        low = s.lower()
+        if ("http" in low or "/" in s or "@" in s
+                or not MIN_PHONE_DIGITS <= len(d) <= MAX_PHONE_DIGITS):
+            skipped += 1
+            continue
+        found.append((field, d))
+    return found, skipped
 
 
 def person_name(p):
@@ -569,12 +540,13 @@ def build_phone_index():
     people = _load_crm_list("people.json", "people")
     gc.collect()
     index, key_counts = {}, Counter()
-    scanned = no_phone = 0
+    scanned = no_phone = skipped_values = 0
     for p in people:
         if not isinstance(p, dict):
             continue
         scanned += 1
-        phones = person_phones(p)
+        phones, skipped = person_phones(p)
+        skipped_values += skipped
         if not phones:
             no_phone += 1
             continue
@@ -601,6 +573,7 @@ def build_phone_index():
         "phones_indexed": len(index),
         "people_with_no_phone": no_phone,
         "top_phone_keys": key_counts.most_common(10),
+        "skipped_non_phone_values": skipped_values,
         "index": index,
     }
     s3_put_bytes(INDEX_KEY, json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
@@ -1073,7 +1046,8 @@ def admin_action(form):
         st = build_phone_index()
         refresh_contacts(load_index())
         return (f"Index rebuilt: {st['people_scanned']} people, {st['phones_indexed']} phones, "
-                f"{st['people_with_no_phone']} without phone.")
+                f"{st['people_with_no_phone']} without phone, "
+                f"{st['skipped_non_phone_values']} non-phone values skipped.")
 
     ck = safe(form.get("contact_key", ""))
     contact = s3_get_json(contact_path(ck))
@@ -1292,6 +1266,7 @@ def render_admin(flash=""):
         f'</b> &middot; people: {index.get("people_scanned", 0)}'
         f' &middot; phones indexed: {index.get("phones_indexed", 0)}'
         f' &middot; people with no phone: {index.get("people_with_no_phone", 0)}'
+        f' &middot; skipped non-phone values: {index.get("skipped_non_phone_values", 0)}'
         f'<br>Top phone keys: {_e(top_keys or "n/a")}</span>'
         + _form("", "rebuild_index", "Rebuild index", "b-personal",
                 "Rebuild the CRM phone index from people.json now?")
