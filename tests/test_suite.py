@@ -351,6 +351,7 @@ class TestWebhook(Base):
 
 class TestBatch(Base):
     def test_one_email_per_client_in_order(self):
+        lf.build_phone_index()
         self.set_status(CK, "client", wa_name="Ivan")
         self.set_status("447700900123", "client", wa_name="Bob")
         self.post(INCOMING)
@@ -401,6 +402,7 @@ class TestBatch(Base):
 
     def test_group_sender_identity(self):
         gk = "120363000000000000_g.us"
+        lf.build_phone_index()
         self.set_status(gk, "client", wa_name="Deal Team", is_group=True, phone="")
         self.post(GROUP)
         unknown = with_id(GROUP, "m-grp-2", "who am I", 1790000200000)
@@ -511,12 +513,12 @@ class TestBatch(Base):
         for k in self.s3.keys("messages/"):
             self.assertFalse(self.s3.json(k)["forwarded"])
 
-    def test_index_failure_does_not_block(self):
-        del self.s3.buckets["full-pipeline-cache"]["people.json"]
+    def test_batch_does_not_rebuild_index(self):
+        self.s3.buckets["full-pipeline-cache"] = {}   # any CRM read would fail
         self.set_status(CK, "client", wa_name="Ivan")
         self.post(INCOMING)
         st = self.batch()
-        self.assertTrue(st["index_error"])
+        self.assertNotIn(lf.INDEX_KEY, self.s3.objects)
         self.assertEqual(st["emails_sent"], 1)
         self.assertIn("Ivan Petrenko [not in CRM]", self.sent()[0]["Subject"])
 
@@ -628,8 +630,12 @@ class TestAdmin(Base):
         self.assertEqual(r["statusCode"], 303)
         self.assertIn(lf.INDEX_KEY, self.s3.objects)
         self.assertEqual(self.contact()["crm_match"], "matched")
+        page = lf.lambda_handler(get_event(key="admin-secret"), None)["body"]
+        self.assertIn("not sent today", page)
         lf.lambda_handler(admin_post(action="send_now"), None)
         self.assertEqual(self.ses.send_raw_email.call_count, 1)
+        page = lf.lambda_handler(get_event(key="admin-secret"), None)["body"]
+        self.assertNotIn("not sent today", page)
 
     def test_admin_bad_key(self):
         self.post(INCOMING)
@@ -679,6 +685,7 @@ class TestAdmin(Base):
         self.assertIn('value="rebuild_index"', page)
         self.assertIn("people with no phone: 1", page)
         self.assertIn("Last batch: <b>never</b>", page)
+        self.assertNotIn("not sent today", page)   # nothing waiting (no clients)
         self.assertIn("confirm(", page)
         page = lf.lambda_handler(get_event(key="admin-secret", view="unparsed"), None)["body"]
         self.assertIn("<pre>", page)

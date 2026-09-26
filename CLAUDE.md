@@ -3,7 +3,8 @@
 Single-file AWS Lambda (`lambda_function.py`, Python 3.12, stdlib + boto3 only) that receives
 WhatsApp messages from TimelinesAI webhooks, lets Chad sort each contact as Client or Personal
 on an admin page, and emails every Client message to the archived Rainmaker inbox (compliance).
-Forwarding is a **once-a-day batch** (one email per Client contact); the webhook never sends email.
+Forwarding is a **once-a-day batch** (one email per Client contact), started by Chad clicking
+"Send now" on the admin page daily; the webhook never sends email.
 Each forwarded contact is identified by full name + company from the Pipeline CRM cache.
 
 - Lambda: `whatsapp-capture` (account 271378210266, us-east-1), invoked via its Function URL.
@@ -20,8 +21,8 @@ Each forwarded contact is identified by full name + company from the Pipeline CR
   `client` | `personal` | `set_identity` (per contact; `full_name`, `company`, `individual`),
   `send_now` (run the daily batch), `rebuild_index`. GET never changes state (the admin page
   computes CRM identity in memory only).
-- Scheduled event with input `{"task": "daily_forward"}` — daily batch (rebuild phone index,
-  then forward). Any other EventBridge scheduled event (`source: aws.events` /
+- Scheduled event with input `{"task": "daily_forward"}` — same batch as "Send now" (optional;
+  no schedule is configured — Chad sends manually). Any other EventBridge scheduled event (`source: aws.events` /
   `detail-type: Scheduled Event`) — daily nudge email listing unsorted contacts.
 
 ## Env vars (names only)
@@ -71,7 +72,9 @@ migrated on write), `crm_match` (`matched`|`ambiguous`|`none`), `crm_person_id`,
 ## CRM identity
 - Source: `s3://full-pipeline-cache/people.json` (`{"people": [...]}`, ~113 MB) and
   `companies.json` (`{"companies": [...]}`); the role can only GetObject these two keys.
-  The batch needs Lambda memory ~2–3 GB and a multi-minute timeout for this.
+  The index is rebuilt ONLY by the admin "Rebuild index" button (the batch just reads
+  `state/phone-index.json`); that button needs Lambda memory ~3 GB and a multi-minute timeout.
+  Contacts added to the CRM after the last rebuild show "[not in CRM]" until the next rebuild.
 - Match on the last 9 digits of the phone. Two different people on one key → ambiguous.
 - Identity precedence: manual override > CRM match > fallback `<WhatsApp name> [not in CRM]`.
   Missing identity never blocks forwarding.

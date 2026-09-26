@@ -878,13 +878,8 @@ def run_batch(trigger):
     try:
         stats = {"run_at": iso(now_utc()), "trigger": trigger, "emails_sent": 0,
                  "messages_forwarded": 0, "messages_waiting": 0, "forwarding_enabled":
-                 forwarding_enabled(), "index_error": None, "errors": []}
-        try:
-            build_phone_index()
-        except Exception as e:
-            print("index rebuild failed:", traceback.format_exc())
-            stats["index_error"] = f"{type(e).__name__}: {e}"[:300]
-        index = load_index()
+                 forwarding_enabled(), "errors": []}
+        index = load_index()  # rebuilt only via the admin "Rebuild index" button
         date = now_utc().strftime("%Y-%m-%d")
         for c in refresh_contacts(index):
             if c.get("status") != "client":
@@ -1067,8 +1062,6 @@ def _batch_flash(st):
         msg += " Daily cap reached."
     if st.get("errors"):
         msg += f" {len(st['errors'])} send error(s)."
-    if st.get("index_error"):
-        msg += f" Index rebuild failed: {st['index_error']}"
     return msg
 
 
@@ -1276,6 +1269,9 @@ def render_admin(flash=""):
         c["held_count"] = _held_count(c)
         waiting += c["held_count"]
     last = s3_get_json(BATCH_KEY) or {}
+    not_sent = ""
+    if waiting and not str(last.get("run_at") or "").startswith(now_utc().strftime("%Y-%m-%d")):
+        not_sent = ' <span class="badge warn">not sent today</span>'
 
     out = ["<h1>WhatsApp Capture</h1>",
            f'<div class="status"><span>Forwarding: <b>'
@@ -1286,7 +1282,7 @@ def render_admin(flash=""):
            f'<div class="status"><span>Last batch: <b>{_e(last.get("run_at") or "never")}</b>'
            f' &middot; emails sent: <b>{last.get("emails_sent", 0)}</b>'
            f' &middot; messages forwarded: <b>{last.get("messages_forwarded", 0)}</b>'
-           f' &middot; messages waiting: <b>{waiting}</b></span>'
+           f' &middot; messages waiting: <b>{waiting}</b>{not_sent}</span>'
            + _form("", "send_now", "Send now", "b-held",
                    f"Run the daily batch now and email {waiting} waiting client message(s)?")
            + "</div>"]
