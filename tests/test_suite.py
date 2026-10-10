@@ -574,6 +574,15 @@ class TestIdentity(Base):
         self.assertIn("WhatsApp | Ivan Override (Override Co) | +380501234567",
                       self.sent()[0]["Subject"])
 
+    def test_identity_form_prefills_wa_name(self):
+        c = {"key": "79161234567", "phone": "79161234567", "wa_name": "Максим Сенченко",
+             "crm_match": "none"}
+        self.assertIn('name="full_name" required placeholder="Full name" '
+                      'value="Максим Сенченко"', lf._identity_fields(c))
+        c["manual_full_name"] = "Maksim Senchenko"
+        self.assertIn('value="Maksim Senchenko"', lf._identity_fields(c))
+        self.assertNotIn("Максим", lf._identity_fields(c))
+
 
 class TestAdmin(Base):
     def test_mark_client_matched_one_click_no_email(self):

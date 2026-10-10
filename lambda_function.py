@@ -1170,7 +1170,7 @@ def _form(ck, action, label, cls, confirm_text, fields=""):
 def _identity_fields(c):
     ind = c.get("manual_individual")
     return (f'<input type="text" name="full_name" required placeholder="Full name" '
-            f'value="{_e(c.get("manual_full_name") or "")}">'
+            f'value="{_e(c.get("manual_full_name") or wa_name(c) or "")}">'
             f'<input type="text" name="company" placeholder="Company" '
             f'value="{_e(c.get("manual_company") or "")}">'
             f'<label><input type="checkbox" name="individual" value="1"'
