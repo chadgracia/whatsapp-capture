@@ -1191,7 +1191,7 @@ def _page(body):
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
             '<meta name="robots" content="noindex,nofollow">'
-            f'<title>WhatsApp Capture</title><style>{CSS}</style></head>'
+            f'<title>WhatsApp Capture</title><link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💬</text></svg>"><style>{CSS}</style></head>'
             f'<body><main>{body}</main><script>{JS}</script></body></html>')
 
 
