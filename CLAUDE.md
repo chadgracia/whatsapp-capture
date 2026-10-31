@@ -19,6 +19,7 @@ Each forwarded contact is identified by full name + company from the Pipeline CR
 - `GET /?key=<ADMIN_KEY>` — admin page. `&view=unparsed` shows the last 20 unparsed payloads.
 - `POST /` form (`key`, `action`, optional `contact_key`) — admin actions, then 303 back:
   `client` | `personal` | `set_identity` (per contact; `full_name`, `company`, `individual`),
+  `bulk_personal` (`contact_keys` comma-separated, max 100; only `unsorted` contacts change),
   `send_now` (run the daily batch), `rebuild_index`. GET never changes state (the admin page
   computes CRM identity in memory only).
 - Scheduled event with input `{"task": "daily_forward"}` — same batch as "Send now" (optional;

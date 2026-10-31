@@ -721,6 +721,110 @@ class TestAdmin(Base):
         self.assertIn("<pre>", page)
 
 
+class TestBulkPersonal(Base):
+    def test_marks_only_unsorted_and_skips_others(self):
+        self.post(INCOMING)                                   # CK unsorted, 1 held + attachment
+        self.post({"chat": {"phone": "+447700900123", "full_name": "Bob"},
+                   "message": {"message_id": "b1", "text": "hi", "direction": "received"}})
+        self.set_status("15550002222", "client", wa_name="Cli")
+        self.set_status("15550003333", "personal", wa_name="Per", last_preview="keep")
+        cli_before = self.s3.objects["contacts/15550002222.json"]
+        per_before = self.s3.objects["contacts/15550003333.json"]
+        r = lf.lambda_handler(admin_post(
+            action="bulk_personal",
+            contact_keys=f"{CK},447700900123,{CK},15550002222,15550003333,999999,,"), None)
+        self.assertEqual(r["statusCode"], 303)
+        for ck in (CK, "447700900123"):
+            c = self.contact(ck)
+            self.assertEqual((c["status"], c["last_preview"], c["msg_count"]),
+                             ("personal", "", 0))
+            self.assertIn("sorted_at", c)
+        for p in (f"messages/{CK}/", f"raw/{CK}/", f"attachments/{CK}/", "seen/",
+                  "messages/447700900123/"):
+            self.assertEqual(self.s3.keys(p), [], p)
+        self.assertEqual(self.s3.objects["contacts/15550002222.json"], cli_before)
+        self.assertEqual(self.s3.objects["contacts/15550003333.json"], per_before)
+        self.assertNotIn("contacts/999999.json", self.s3.objects)
+        flash = urllib.parse.unquote_plus(r["headers"]["Location"])
+        self.assertIn("Marked 2 contact(s) Personal: Ivan Petrenko, Bob.", flash)
+        self.assertIn("Skipped 3.", flash)
+        self.ses.send_raw_email.assert_not_called()
+
+    def test_keeps_forwarded_messages(self):
+        self.set_status(CK, "client", wa_name="Ivan")
+        self.post(INCOMING)
+        self.batch()                                          # m-in-1 forwarded
+        self.post(OUTGOING)                                   # held
+        rec = self.contact()
+        rec["status"] = "unsorted"
+        self.s3.objects[f"contacts/{CK}.json"] = json.dumps(rec).encode()
+        lf.lambda_handler(admin_post(action="bulk_personal", contact_keys=CK), None)
+        msgs = self.s3.keys(f"messages/{CK}/")
+        self.assertEqual([self.s3.json(k)["message_id"] for k in msgs], ["m-in-1"])
+        self.assertEqual(self.s3.keys(f"attachments/{CK}/"),
+                         [f"attachments/{CK}/m-in-1/terms.pdf"])
+        c = self.contact()
+        self.assertEqual((c["status"], c["msg_count"]), ("personal", 1))
+
+    def test_empty_contact_keys_ignored(self):
+        self.post(INCOMING)
+        snapshot = dict(self.s3.objects)
+        for keys in ("", " , ,", None):
+            fields = {} if keys is None else {"contact_keys": keys}
+            r = lf.lambda_handler(admin_post(action="bulk_personal", **fields), None)
+            self.assertEqual(r["statusCode"], 303)
+            self.assertIn("No contacts selected",
+                          urllib.parse.unquote_plus(r["headers"]["Location"]))
+        self.assertEqual(self.s3.objects, snapshot)
+
+    def test_capped_at_100(self):
+        for i in range(105):
+            self.set_status(f"1555{i:07d}", "unsorted")
+        keys = ",".join(f"1555{i:07d}" for i in range(105))
+        lf.lambda_handler(admin_post(action="bulk_personal", contact_keys=keys), None)
+        statuses = [self.contact(f"1555{i:07d}")["status"] for i in range(105)]
+        self.assertEqual(statuses.count("personal"), 100)
+        self.assertEqual(statuses[100:], ["unsorted"] * 5)
+
+    def test_one_failure_does_not_stop_rest(self):
+        self.set_status("15550001111", "unsorted", wa_name="A")
+        self.set_status("15550002222", "unsorted", wa_name="B")
+        real = lf.delete_unforwarded
+
+        def boom(ck):
+            if ck == "15550001111":
+                raise RuntimeError("s3 down")
+            return real(ck)
+        with mock.patch.object(lf, "delete_unforwarded", side_effect=boom):
+            r = lf.lambda_handler(admin_post(action="bulk_personal",
+                                             contact_keys="15550001111,15550002222"), None)
+        self.assertEqual(self.contact("15550001111")["status"], "unsorted")
+        self.assertEqual(self.contact("15550002222")["status"], "personal")
+        flash = urllib.parse.unquote_plus(r["headers"]["Location"])
+        self.assertIn("Marked 1 contact(s) Personal: B.", flash)
+        self.assertIn("Errors: 15550001111.", flash)
+
+    def test_page_checkboxes_only_when_to_sort_nonempty(self):
+        self.set_status("15550002222", "client", wa_name="Cli")
+        page = lf.lambda_handler(get_event(key="admin-secret"), None)["body"]
+        self.assertIn("Nothing to sort.", page)
+        self.assertNotIn('id="bulk-form"', page)
+        self.assertNotIn('class="bulk-pick"', page)
+        self.post(INCOMING)
+        page = lf.lambda_handler(get_event(key="admin-secret"), None)["body"]
+        self.assertIn('id="bulk-form"', page)
+        self.assertIn('value="bulk_personal"', page)
+        self.assertIn('name="contact_keys" value=""', page)
+        self.assertIn("Mark selected Personal (0)</button>", page)
+        self.assertIn('type="submit" disabled', page)
+        self.assertEqual(page.count('class="bulk-pick"'), 1)    # client card has none
+        self.assertIn(f'class="bulk-pick" value="{CK}" data-name="Ivan Petrenko" '
+                      'data-held="1"', page)
+        self.assertIn('value="personal"', page)                # per-card buttons kept
+        self.assertIn("Select all", page)
+        self.assertIn("f.id==='bulk-form'", page)              # generic confirm skips bulk
+
+
 class TestNudge(Base):
     def test_nudge(self):
         ev = {"source": "aws.events", "detail-type": "Scheduled Event"}

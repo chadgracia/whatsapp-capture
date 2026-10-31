@@ -1038,8 +1038,55 @@ def _batch_flash(st):
     return msg
 
 
+def mark_personal(ck, contact):
+    """Delete unforwarded content and set the contact to Personal (forwarded msgs kept)."""
+    kept = delete_unforwarded(ck)
+    contact["status"] = "personal"
+    contact["sorted_at"] = iso(now_utc())
+    contact["last_preview"] = ""
+    contact["msg_count"] = kept
+    s3_put_json(contact_path(ck), contact)
+
+
+BULK_MAX = 100
+
+
+def bulk_personal(form):
+    """Mark several UNSORTED contacts Personal. Clients / Personal / missing are skipped."""
+    keys = []
+    for k in form.get("contact_keys", "").split(","):
+        if k.strip():
+            sk = safe(k.strip())
+            if sk not in keys:
+                keys.append(sk)
+    keys = keys[:BULK_MAX]
+    if not keys:
+        return "No contacts selected."
+    done, skipped, errors = [], 0, []
+    for ck in keys:
+        try:
+            contact = s3_get_json(contact_path(ck))
+            if not contact or contact.get("status", "unsorted") != "unsorted":
+                skipped += 1
+                continue
+            migrate_contact(contact)
+            mark_personal(ck, contact)
+            done.append(wa_name(contact))
+        except Exception as exc:  # one failure must not stop the rest
+            print(f"bulk_personal: {ck}: {exc!r}")
+            errors.append(ck)
+    msg = f"Marked {len(done)} contact(s) Personal: {', '.join(done)}."
+    if skipped:
+        msg += f" Skipped {skipped}."
+    if errors:
+        msg += f" Errors: {', '.join(errors)}."
+    return msg
+
+
 def admin_action(form):
     action = form.get("action", "")
+    if action == "bulk_personal":
+        return bulk_personal(form)
     if action == "send_now":
         return _batch_flash(run_batch("admin"))
     if action == "rebuild_index":
@@ -1074,12 +1121,7 @@ def admin_action(form):
         s3_put_json(contact_path(ck), contact)
         return f"{name} identity set to {fields['manual_full_name']}."
     if action == "personal":
-        kept = delete_unforwarded(ck)
-        contact["status"] = "personal"
-        contact["sorted_at"] = iso(now_utc())
-        contact["last_preview"] = ""
-        contact["msg_count"] = kept
-        s3_put_json(contact_path(ck), contact)
+        mark_personal(ck, contact)
         return f"{name} marked Personal. Unforwarded content deleted."
     return "Unknown action."
 
@@ -1146,11 +1188,37 @@ font-size:14px}.idform label{font-size:12px;color:#444}
 details summary{cursor:pointer;font-size:14px;color:#2463eb;padding:8px 4px}
 pre{background:#fff;border:1px solid #e1e4e8;border-radius:8px;padding:10px;overflow-x:auto;
 font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.bulkbar{background:#fff;border:1px solid #e1e4e8;border-radius:8px;padding:8px 12px;
+margin:8px 0;display:flex;gap:10px;align-items:center;justify-content:space-between;
+flex-wrap:wrap}.bulkbar label{display:flex;gap:8px;align-items:center;font-size:14px;
+cursor:pointer}.bulkbar button:disabled{opacity:.5;cursor:not-allowed}
+.pick{flex:0 0 auto;display:flex;align-items:center;padding-top:2px}
+input.bulk-pick,#bulk-all{width:18px;height:18px;min-width:18px;margin:0;cursor:pointer}
 """
 
 JS = """
 document.addEventListener('submit',function(e){var f=e.target;
+if(f.id==='bulk-form'){return;}
 if(!confirm(f.getAttribute('data-confirm'))){e.preventDefault();}});
+(function(){var f=document.getElementById('bulk-form');if(!f){return;}
+var all=document.getElementById('bulk-all'),btn=document.getElementById('bulk-btn');
+function picks(){return Array.prototype.slice.call(document.querySelectorAll('input.bulk-pick'));}
+function checked(){return picks().filter(function(b){return b.checked;});}
+function update(){var n=checked().length,p=picks().length;
+btn.textContent='Mark selected Personal ('+n+')';btn.disabled=(n===0);
+all.checked=(p>0&&n===p);all.indeterminate=(n>0&&n<p);}
+document.addEventListener('change',function(e){var t=e.target;
+if(t===all){picks().forEach(function(b){b.checked=all.checked;});update();}
+else if(t.classList&&t.classList.contains('bulk-pick')){update();}});
+f.addEventListener('submit',function(e){var c=checked();
+if(!c.length){e.preventDefault();return;}
+var m=0,names=[];c.forEach(function(b){m+=parseInt(b.getAttribute('data-held'),10)||0;
+names.push(b.getAttribute('data-name'));});
+var txt='Mark '+c.length+' contact(s) as PERSONAL and permanently delete '+m+
+' held message(s)?\\n\\n'+names.join('\\n');
+if(!confirm(txt)){e.preventDefault();return;}
+f.querySelector('input[name=contact_keys]').value=c.map(function(b){return b.value;}).join(',');});
+update();})();
 """
 
 
@@ -1277,10 +1345,21 @@ def render_admin(flash=""):
     out.append(f"<h2>To sort ({len(by['unsorted'])})</h2>")
     if not by["unsorted"]:
         out.append('<p class="empty">Nothing to sort.</p>')
+    else:
+        out.append(
+            '<form method="POST" action="/" id="bulk-form" class="bulkbar">'
+            f'<input type="hidden" name="key" value="{_e(env("ADMIN_KEY"))}">'
+            '<input type="hidden" name="action" value="bulk_personal">'
+            '<input type="hidden" name="contact_keys" value="">'
+            '<label><input type="checkbox" id="bulk-all"> Select all</label>'
+            '<button class="b-personal" id="bulk-btn" type="submit" disabled>'
+            'Mark selected Personal (0)</button></form>')
     for c in by["unsorted"]:
         n = c.get("msg_count", 0)
         out.append(
-            f'<div class="card"><div class="info">{_name_html(c)} &middot; {n} held &middot; '
+            f'<div class="card"><div class="pick"><input type="checkbox" class="bulk-pick" '
+            f'value="{_e(c["key"])}" data-name="{_e(wa_name(c))}" data-held="{_e(n)}" '
+            f'aria-label="Select {_e(wa_name(c))}"></div><div class="info">{_name_html(c)} &middot; {n} held &middot; '
             f'last seen {_e(c.get("last_seen"))}</div><div class="preview">'
             f'{_e(c.get("last_preview"))}</div></div><div class="btns">'
             + _client_button(c, "Client")
