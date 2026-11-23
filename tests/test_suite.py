@@ -921,11 +921,13 @@ class TestPinGate(Base):
         loc = r["headers"]["Location"]
         self.assertNotIn("pin=", loc)
         c = r["headers"]["Set-Cookie"]
-        for attr in ("HttpOnly", "Secure", "SameSite=Lax", "Path=/", "Max-Age=43200"):
+        for attr in ("HttpOnly", "Secure", "SameSite=Lax", "Path=/", "Max-Age=2592000"):
             self.assertIn(attr, c)
         val = c.split(";")[0].split("=", 1)[1]
         exp, sig = val.split(".")
         self.assertEqual(val, pin_cookie(exp=int(exp)))
+        import time
+        self.assertAlmostEqual(int(exp), int(time.time()) + 2592000, delta=5)   # signed 30-day expiry
         ev = get_event(key="admin-secret", _pin=False)
         ev["cookies"] = [c.split(";")[0]]
         self.assertIn("WhatsApp Capture", lf.lambda_handler(ev, None)["body"])

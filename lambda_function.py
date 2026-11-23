@@ -1420,7 +1420,7 @@ def render_unparsed():
 # ---------------------------------------------------------------------------
 
 PIN_COOKIE = "wa_pin"
-PIN_TTL = 12 * 3600
+PIN_TTL = 30 * 24 * 3600  # 30 days (2592000 s)
 PIN_ATTEMPTS_KEY = "pin-attempts.json"
 PIN_MAX_FAILS = 5
 PIN_WINDOW = 15 * 60

@@ -24,7 +24,7 @@ Each forwarded contact is identified by full name + company from the Pipeline CR
   computes CRM identity in memory only).
 - PIN gate: every ADMIN_KEY path (GET admin / `view=unparsed`, every admin POST) also needs a valid
   `wa_pin` cookie (`<exp>.<hex HMAC-SHA256(ADMIN_KEY+WA_PIN, "wa-pin-v1:"+exp)>`, HttpOnly, Secure,
-  SameSite=Lax, 12 h). Without it GET shows only the PIN form and POSTs are refused (401, nothing done).
+  SameSite=Lax, 30 days). Without it GET shows only the PIN form and POSTs are refused (401, nothing done).
   POST `action=pin` + `pin` checks WA_PIN; 5 failures in 15 min (`pin-attempts.json` in BUCKET, list of
   unix times; cleared on success) = 429 "Too many attempts" even for the right PIN; S3 error = locked.
   WA_PIN empty = 503 "PIN not configured" on all admin paths. Webhook and scheduled paths are not gated.
