@@ -1255,12 +1255,12 @@ def _client_button(c, label):
                  f"Mark {who} as CLIENT with this name/company?", _identity_fields(c))
 
 
-def _page(body):
+def _page(body, js=True):
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
             '<meta name="robots" content="noindex,nofollow">'
             f'<title>WhatsApp Capture</title><link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💬</text></svg>"><style>{CSS}</style></head>'
-            f'<body><main>{body}</main><script>{JS}</script></body></html>')
+            f'<body><main>{body}</main>{f"<script>{JS}</script>" if js else ""}</body></html>')
 
 
 def _phone(c):
@@ -1416,6 +1416,131 @@ def render_unparsed():
 
 
 # ---------------------------------------------------------------------------
+# PIN gate (admin pages): ADMIN_KEY link + wa_pin cookie, cookie set after WA_PIN
+# ---------------------------------------------------------------------------
+
+PIN_COOKIE = "wa_pin"
+PIN_TTL = 12 * 3600
+PIN_ATTEMPTS_KEY = "pin-attempts.json"
+PIN_MAX_FAILS = 5
+PIN_WINDOW = 15 * 60
+PIN_BAD_MSG = "Incorrect PIN"
+PIN_LOCKED_MSG = "Too many attempts. Try again in 15 minutes."
+
+
+def _now_ts():
+    return int(now_utc().timestamp())
+
+
+def _pin_sig(exp):
+    k = (env("ADMIN_KEY") + env("WA_PIN")).encode()
+    return hmac.new(k, f"wa-pin-v1:{exp}".encode(), hashlib.sha256).hexdigest()
+
+
+def make_pin_cookie():
+    exp = _now_ts() + PIN_TTL
+    return f"{exp}.{_pin_sig(exp)}"
+
+
+def pin_cookie_ok(value):
+    if not value or not env("ADMIN_KEY") or not env("WA_PIN"):
+        return False
+    exp_s, _, sig = str(value).partition(".")
+    if not exp_s.isdigit() or not sig:
+        return False
+    exp = int(exp_s)
+    if exp <= _now_ts():
+        return False
+    return hmac.compare_digest(sig.encode(), _pin_sig(exp).encode())
+
+
+def _cookies(event):
+    """Cookie pairs from event["cookies"] (Function URL v2) and the Cookie header."""
+    parts = list(event.get("cookies") or [])
+    for k, v in (event.get("headers") or {}).items():
+        if str(k).lower() == "cookie" and v:
+            parts.extend(str(v).split(";"))
+    out = {}
+    for p in parts:
+        name, sep, val = str(p).strip().partition("=")
+        if sep and name.strip() and name.strip() not in out:
+            out[name.strip()] = val.strip()
+    return out
+
+
+def pin_session_ok(event):
+    return pin_cookie_ok(_cookies(event).get(PIN_COOKIE))
+
+
+def _pin_cookie_header():
+    return (f"{PIN_COOKIE}={make_pin_cookie()}; HttpOnly; Secure; SameSite=Lax; "
+            f"Path=/; Max-Age={PIN_TTL}")
+
+
+def _recent_fails():
+    """Failure timestamps within the window. Raises on S3/parse errors (caller fails closed)."""
+    data = s3_get_json(PIN_ATTEMPTS_KEY)
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise ValueError("pin-attempts.json is not a list")
+    cutoff = _now_ts() - PIN_WINDOW
+    return [int(t) for t in data if int(t) > cutoff]
+
+
+def _pin_attempt(pin):
+    """Returns "ok", "bad" or "locked". Any S3 read/write failure = "locked"."""
+    try:
+        fails = _recent_fails()
+    except Exception as e:
+        print("pin-attempts read failed:", type(e).__name__)
+        return "locked"
+    if len(fails) >= PIN_MAX_FAILS:
+        return "locked"
+    if key_ok(pin, env("WA_PIN")):
+        try:
+            s3_put_json(PIN_ATTEMPTS_KEY, [])
+        except Exception as e:
+            print("pin-attempts write failed:", type(e).__name__)
+            return "locked"
+        return "ok"
+    try:
+        s3_put_json(PIN_ATTEMPTS_KEY, fails + [_now_ts()])
+    except Exception as e:
+        print("pin-attempts write failed:", type(e).__name__)
+        return "locked"
+    return "bad"
+
+
+def render_pin(msg=""):
+    out = ["<h1>WhatsApp Capture</h1>"]
+    if msg:
+        out.append(f'<div class="flash">{_e(msg)}</div>')
+    out.append('<form method="POST" action="/" class="card">'
+               f'<input type="hidden" name="key" value="{_e(env("ADMIN_KEY"))}">'
+               '<input type="hidden" name="action" value="pin">'
+               '<input type="password" name="pin" inputmode="numeric" autocomplete="off" '
+               'autofocus required placeholder="PIN" aria-label="PIN">'
+               '<button class="b-client" type="submit">Unlock</button></form>')
+    return _page("".join(out), js=False)
+
+
+def render_pin_locked():
+    return _page(f'<h1>WhatsApp Capture</h1><div class="flash">{_e(PIN_LOCKED_MSG)}</div>',
+                 js=False)
+
+
+def _gate_html(status, body):
+    r = html_resp(body)
+    r["statusCode"] = status
+    return r
+
+
+def pin_not_configured():
+    return resp(503, "PIN not configured")
+
+
+# ---------------------------------------------------------------------------
 # Lambda entry
 # ---------------------------------------------------------------------------
 
@@ -1462,6 +1587,10 @@ def lambda_handler(event, context):
 
     if method == "GET":
         if key_ok(qkey, env("ADMIN_KEY")):
+            if not env("WA_PIN"):
+                return pin_not_configured()
+            if not pin_session_ok(event):
+                return html_resp(render_pin(PIN_BAD_MSG if q.get("pin") == "bad" else ""))
             if q.get("view") == "unparsed":
                 return html_resp(render_unparsed())
             return html_resp(render_admin(q.get("msg", "")))
@@ -1486,6 +1615,22 @@ def lambda_handler(event, context):
 
     form = dict(urllib.parse.parse_qsl(raw.decode("utf-8", "replace")))
     if key_ok(form.get("key", ""), env("ADMIN_KEY")):
+        if not env("WA_PIN"):
+            return pin_not_configured()
+        if form.get("action") == "pin":
+            result = _pin_attempt(form.get("pin", ""))
+            if result == "locked":
+                return _gate_html(429, render_pin_locked())
+            if result == "bad":
+                loc = "/?" + urllib.parse.urlencode({"key": env("ADMIN_KEY"), "pin": "bad"})
+                return resp(303, "", headers={"Location": loc})
+            loc = "/?" + urllib.parse.urlencode({"key": env("ADMIN_KEY")})
+            cookie = _pin_cookie_header()
+            r = resp(303, "", headers={"Location": loc, "Set-Cookie": cookie})
+            r["cookies"] = [cookie]
+            return r
+        if not pin_session_ok(event):
+            return _gate_html(401, render_pin())
         try:
             flash = admin_action(form)
         except Exception as e:

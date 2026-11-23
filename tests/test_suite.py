@@ -23,6 +23,7 @@ ENV = {
     "FROM_ADDR": "capture@example.com",
     "TO_ADDR": "archive@example.com",
     "FORWARDING_ENABLED": "true",
+    "WA_PIN": "4321",
 }
 
 MAIN = "test-bucket"
@@ -138,15 +139,32 @@ def webhook_event(payload, key="hook-secret"):
     return ev
 
 
-def admin_post(ck="", action="", key="admin-secret", **fields):
+def pin_cookie(exp=None, admin="admin-secret", pin="4321"):
+    """Independent implementation of the wa_pin cookie value."""
+    import hashlib
+    import hmac
+    import time
+    exp = int(time.time()) + 3600 if exp is None else exp
+    sig = hmac.new((admin + pin).encode(), f"wa-pin-v1:{exp}".encode(),
+                   hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def admin_post(ck="", action="", key="admin-secret", _pin=True, **fields):
     data = {"key": key, "contact_key": ck, "action": action}
     data.update(fields)
-    return {"requestContext": {"http": {"method": "POST"}},
-            "body": urllib.parse.urlencode(data), "isBase64Encoded": False}
+    ev = {"requestContext": {"http": {"method": "POST"}},
+          "body": urllib.parse.urlencode(data), "isBase64Encoded": False}
+    if _pin:
+        ev["cookies"] = ["wa_pin=" + pin_cookie()]
+    return ev
 
 
-def get_event(**q):
-    return {"requestContext": {"http": {"method": "GET"}}, "queryStringParameters": q}
+def get_event(_pin=True, **q):
+    ev = {"requestContext": {"http": {"method": "GET"}}, "queryStringParameters": q}
+    if _pin:
+        ev["cookies"] = ["wa_pin=" + pin_cookie()]
+    return ev
 
 
 BATCH_EVENT = {"task": "daily_forward"}
@@ -837,6 +855,145 @@ class TestNudge(Base):
         body = self.text_of(m)
         self.assertIn(lf.FUNCTION_URL + "?key=admin-secret", body)
         self.assertIn("Hello, about the deal", body)
+
+
+class TestPinGate(Base):
+    def pin_post(self, pin):
+        return lf.lambda_handler(admin_post(action="pin", pin=pin, _pin=False), None)
+
+    def assert_pin_page(self, r):
+        body = r["body"]
+        self.assertIn('name="action" value="pin"', body)
+        self.assertIn('type="password" name="pin" inputmode="numeric" autocomplete="off" '
+                      'autofocus', body)
+        for leak in ("Ivan", "Petrenko", "Hello, about the deal", CK, "msg_count",
+                     "Unsorted", "bulk-form"):
+            self.assertNotIn(leak, body)
+
+    def test_get_without_cookie_shows_pin_page_only(self):
+        self.post(INCOMING)
+        r = lf.lambda_handler(get_event(key="admin-secret", _pin=False), None)
+        self.assertEqual(r["statusCode"], 200)
+        self.assert_pin_page(r)
+
+    def test_get_with_valid_cookie_shows_admin(self):
+        self.post(INCOMING)
+        ev = get_event(key="admin-secret", _pin=False)
+        ev["headers"] = {"cookie": "other=1; wa_pin=" + pin_cookie()}   # Cookie header path
+        body = lf.lambda_handler(ev, None)["body"]
+        self.assertIn("Ivan Petrenko", body)
+        self.assertNotIn('value="pin"', body)
+
+    def test_bad_cookies_rejected(self):
+        self.post(INCOMING)
+        import time
+        for val in (pin_cookie(exp=int(time.time()) - 5),       # expired
+                    pin_cookie(pin="9999"),                       # wrong PIN key
+                    pin_cookie(admin="other"),                    # wrong ADMIN_KEY
+                    "9999999999.deadbeef", "garbage", ""):
+            ev = get_event(key="admin-secret", _pin=False)
+            ev["cookies"] = ["wa_pin=" + val]
+            self.assert_pin_page(lf.lambda_handler(ev, None))
+
+    def test_unparsed_without_cookie_shows_pin_page(self):
+        lf.lambda_handler(webhook_event({"weird": "secret-payload-text"}), None)
+        r = lf.lambda_handler(get_event(key="admin-secret", view="unparsed", _pin=False), None)
+        self.assert_pin_page(r)
+        self.assertNotIn("secret-payload-text", r["body"])
+
+    def test_admin_post_without_cookie_does_nothing(self):
+        self.post(INCOMING)
+        before = dict(self.s3.objects)
+        writes = self.s3.writes
+        for action in ("personal", "client", "send_now", "rebuild_index", "bulk_personal"):
+            r = lf.lambda_handler(admin_post(CK, action, _pin=False, contact_keys=CK,
+                                             full_name="X Y"), None)
+            self.assertEqual(r["statusCode"], 401)
+            self.assert_pin_page(r)
+        self.assertEqual(self.s3.writes, writes)
+        self.assertEqual(self.s3.objects, before)
+        self.ses.send_raw_email.assert_not_called()
+        self.assertEqual(self.contact()["status"], "unsorted")
+
+    def test_correct_pin_sets_cookie(self):
+        r = self.pin_post("4321")
+        self.assertEqual(r["statusCode"], 303)
+        loc = r["headers"]["Location"]
+        self.assertNotIn("pin=", loc)
+        c = r["headers"]["Set-Cookie"]
+        for attr in ("HttpOnly", "Secure", "SameSite=Lax", "Path=/", "Max-Age=43200"):
+            self.assertIn(attr, c)
+        val = c.split(";")[0].split("=", 1)[1]
+        exp, sig = val.split(".")
+        self.assertEqual(val, pin_cookie(exp=int(exp)))
+        ev = get_event(key="admin-secret", _pin=False)
+        ev["cookies"] = [c.split(";")[0]]
+        self.assertIn("WhatsApp Capture", lf.lambda_handler(ev, None)["body"])
+        self.assertNotIn('value="pin"', lf.lambda_handler(ev, None)["body"])
+        self.assertEqual(self.s3.json("pin-attempts.json"), [])
+
+    def test_wrong_pin_rejected(self):
+        r = self.pin_post("0000")
+        self.assertEqual(r["statusCode"], 303)
+        self.assertNotIn("Set-Cookie", r["headers"])
+        self.assertNotIn("cookies", r)
+        q = dict(urllib.parse.parse_qsl(r["headers"]["Location"].split("?", 1)[1]))
+        self.assertEqual(q.get("pin"), "bad")
+        page = lf.lambda_handler(get_event(_pin=False, **q), None)["body"]
+        self.assertIn("Incorrect PIN", page)
+        self.assertEqual(len(self.s3.json("pin-attempts.json")), 1)
+
+    def test_lockout_after_five_failures(self):
+        for _ in range(5):
+            self.assertEqual(self.pin_post("0000")["statusCode"], 303)
+        r = self.pin_post("4321")                    # 6th attempt, correct PIN
+        self.assertEqual(r["statusCode"], 429)
+        self.assertIn("Too many attempts. Try again in 15 minutes.", r["body"])
+        self.assertNotIn("Set-Cookie", r["headers"])
+
+    def test_lockout_expires_after_window(self):
+        import time
+        old = int(time.time()) - 16 * 60
+        self.s3.objects["pin-attempts.json"] = json.dumps([old] * 5).encode()
+        self.assertEqual(self.pin_post("4321")["statusCode"], 303)
+
+    def test_s3_failure_fails_closed(self):
+        self.s3.objects["pin-attempts.json"] = b"not json"
+        r = self.pin_post("4321")
+        self.assertEqual(r["statusCode"], 429)
+        self.assertNotIn("Set-Cookie", r["headers"])
+        self.s3.objects.pop("pin-attempts.json")
+        with mock.patch.object(self.s3, "put_object", side_effect=FakeClientError("AccessDenied")):
+            self.assertEqual(self.pin_post("4321")["statusCode"], 429)
+
+    def test_webhook_needs_no_pin(self):
+        r = lf.lambda_handler(get_event(key="hook-secret", _pin=False), None)
+        self.assertEqual((r["statusCode"], r["body"]), (200, "ok"))
+        r = self.post(INCOMING)
+        self.assertEqual((r["statusCode"], r["body"]), (200, "ok"))
+        self.assertTrue(self.s3.keys("contacts/"))
+
+    def test_scheduled_events_still_run(self):
+        self.post(INCOMING)
+        lf.lambda_handler({"source": "aws.events", "detail-type": "Scheduled Event"}, None)
+        self.assertEqual(len(self.sent()), 1)                     # nudge, no cookie
+        c = self.contact()
+        c["status"] = "client"
+        self.s3.objects[f"contacts/{CK}.json"] = json.dumps(c).encode()
+        lf.lambda_handler(dict(BATCH_EVENT), None)                # daily_forward, no cookie
+        self.assertEqual(len(self.sent()), 2)
+        self.assertTrue(self.s3.keys("state/batch-last.json"))
+
+    def test_pin_unset_returns_503(self):
+        os.environ["WA_PIN"] = ""
+        self.post(INCOMING)
+        evs = [get_event(key="admin-secret"), get_event(key="admin-secret", view="unparsed"),
+               admin_post(CK, "personal"), admin_post(action="pin", pin="")]
+        for ev in evs:
+            r = lf.lambda_handler(ev, None)
+            self.assertEqual(r["statusCode"], 503)
+            self.assertEqual(r["body"], "PIN not configured")
+        self.assertEqual(self.contact()["status"], "unsorted")
 
 
 if __name__ == "__main__":
